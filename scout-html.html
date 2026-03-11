@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Scout AI</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.js"></script>
+</head>
+<body class="bg-slate-50">
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useEffect } = React;
+
+// ─── Storage (localStorage) ────────────────────────────────────
+const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+const load = (k, fb) => { try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : fb; } catch { return fb; } };
+
+// ─── Prompts ───────────────────────────────────────────────────
+const buildScoutPrompt = (company, job, candidate, template) => {
+  const hasMarkers = template && /\{\{.+?\}\}/.test(template);
+  return `あなたは優秀な採用担当者です。以下の情報をもとに、スカウトメッセージを生成してください。
+
+【会社情報】
+${company.name ? `会社名: ${company.name}` : ""}
+${company.business ? `事業内容: ${company.business}` : ""}
+${company.culture ? `社風: ${company.culture}` : ""}
+${company.appeal ? `魅力: ${company.appeal}` : ""}
+
+【求人情報】
+${job.title ? `ポジション: ${job.title}` : ""}
+${job.description ? `業務内容: ${job.description}` : ""}
+${job.requirements ? `必要スキル: ${job.requirements}` : ""}
+${job.conditions ? `条件: ${job.conditions}` : ""}
+
+【候補者情報】
+氏名: ${candidate.name || "不明"}
+スキル: ${candidate.skills || "不明"}
+経験年数: ${candidate.experience || "不明"}
+現職: ${candidate.current_company || "不明"}
+備考: ${candidate.background || "なし"}
+
+【テンプレート】
+${template || "（なし）"}
+
+【ルール】
+- 件名と本文を生成する / 本文250〜350文字
+${hasMarkers
+  ? "- {{〜}}で囲まれた箇所のみ書き換える。それ以外は一字一句変えない。{{}}記号は出力しない"
+  : "- テンプレートをベースに候補者・求人に合わせてパーソナライズ"}
+- 出力形式: 件名: 〜\n本文:\n〜`;
+};
+
+const extractPrompt = t => `以下のプロフィールテキストから候補者情報を抽出し、JSON形式のみで出力してください（コードブロック・説明文不要）。
+{"name":"","skills":"","experience":"","current_company":"","background":""}
+【テキスト】\n${t}`;
+
+// ─── API call ──────────────────────────────────────────────────
+const callAPI = async (apiKey, messages, maxTokens = 1000) => {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
+    body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: maxTokens, messages }),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+  return data.content?.map(b => b.text || "").join("") || "";
+};
+
+// ─── UI Parts ──────────────────────────────────────────────────
+const Badge = ({ s }) => {
+  const m = { idle: ["未生成", "bg-gray-100 text-gray-400"], loading: ["生成中…", "bg-blue-100 text-blue-500"], done: ["生成済", "bg-green-100 text-green-600"], error: ["エラー", "bg-red-100 text-red-500"] };
+  const [l, c] = m[s] || m.idle;
+  return <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${c}`}>{l}</span>;
+};
+
+const Textarea = ({ label, value, onChange, rows = 3, placeholder, hint }) => (
+  <div className="mb-4">
+    <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">
+      {label}{hint && <span className="normal-case font-normal text-gray-400 ml-1">{hint}</span>}
+    </label>
+    <textarea rows={rows} value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder}
+      className="w-full border border-gray-200 rounded-xl px-4 py-3 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-200 resize-none leading-relaxed placeholder-gray-300" />
+  </div>
+);
+
+const Input = ({ label, value, onChange, placeholder, type = "text" }) => (
+  <div className="mb-4">
+    <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">{label}</label>
+    <input type={type} value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder}
+      className="w-full border border-gray-200 rounded-xl px-4 py-3 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-200 placeholder-gray-300" />
+  </div>
+);
+
+const Card = ({ title, icon, children, action }) => (
+  <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+    <div className="flex items-center justify-between px-6 py-4 border-b border-gray-50">
+      <div className="flex items-center gap-2">
+        <span className="text-lg">{icon}</span>
+        <h2 className="font-semibold text-gray-800 text-sm">{title}</h2>
+      </div>
+      {action}
+    </div>
+    <div className="px-6 py-5">{children}</div>
+  </div>
+);
+
+// ═══════════════════════════════════════════════════════════════
+function App() {
+  const [tab, setTab] = useState(0);
+  const [apiKey, setApiKey] = useState(() => load("apiKey", ""));
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [apiKeySaved, setApiKeySaved] = useState(false);
+
+  const [company, setCompany] = useState(() => load("company", { name: "", business: "", culture: "", appeal: "" }));
+  const [companySaved, setCompanySaved] = useState(false);
+  const [jobs, setJobs] = useState(() => load("jobs", []));
+  const [editingJob, setEditingJob] = useState(null);
+  const [jobForm, setJobForm] = useState({ title: "", description: "", requirements: "", conditions: "", template: "" });
+
+  const [candidates, setCandidates] = useState(() => load("candidates", []));
+  const [pasteText, setPasteText] = useState("");
+  const [extracting, setExtracting] = useState(false);
+  const [extractErr, setExtractErr] = useState("");
+  const [editingCand, setEditingCand] = useState(null);
+  const [candForm, setCandForm] = useState({});
+
+  const [selJob, setSelJob] = useState(() => { const j = load("jobs", []); return j[0]?.id || ""; });
+  const [messages, setMessages] = useState({});
+  const [statuses, setStatuses] = useState({});
+  const [openCard, setOpenCard] = useState(null);
+  const [editMsgIdx, setEditMsgIdx] = useState(null);
+  const [editMsgVal, setEditMsgVal] = useState("");
+  const [copied, setCopied] = useState(null);
+  const fileRef = useRef();
+
+  // ── Company ─────────────────────────────────────────────────
+  const saveCompany = () => { save("company", company); setCompanySaved(true); setTimeout(() => setCompanySaved(false), 2000); };
+
+  // ── Jobs ────────────────────────────────────────────────────
+  const openNewJob = () => { setEditingJob("new"); setJobForm({ title: "", description: "", requirements: "", conditions: "", template: "" }); };
+  const openEditJob = j => { setEditingJob(j.id); setJobForm({ ...j }); };
+  const saveJob = () => {
+    const id = editingJob === "new" ? Date.now().toString() : editingJob;
+    const updated = editingJob === "new" ? [...jobs, { ...jobForm, id }] : jobs.map(j => j.id === id ? { ...jobForm, id } : j);
+    setJobs(updated); save("jobs", updated);
+    if (!selJob) setSelJob(id);
+    setEditingJob(null);
+  };
+  const deleteJob = id => { const u = jobs.filter(j => j.id !== id); setJobs(u); save("jobs", u); if (selJob === id) setSelJob(u[0]?.id || ""); };
+
+  // ── Candidates ──────────────────────────────────────────────
+  const extractCandidate = async () => {
+    if (!pasteText.trim() || !apiKey) return;
+    setExtracting(true); setExtractErr("");
+    try {
+      const raw = await callAPI(apiKey, [{ role: "user", content: extractPrompt(pasteText) }], 400);
+      const parsed = JSON.parse(raw.trim());
+      const updated = [...candidates, { ...parsed, id: Date.now().toString() }];
+      setCandidates(updated); save("candidates", updated);
+      setPasteText(""); setMessages({}); setStatuses({});
+    } catch { setExtractErr("抽出に失敗しました。テキストを確認してください。"); }
+    finally { setExtracting(false); }
+  };
+
+  const parseCsv = text => {
+    const lines = text.trim().split("\n"); if (lines.length < 2) return [];
+    const headers = lines[0].split(",").map(h => h.trim().replace(/^"|"$/g, ""));
+    return lines.slice(1).map((line, i) => {
+      const vals = line.split(",").map(v => v.trim().replace(/^"|"$/g, ""));
+      const obj = { id: Date.now().toString() + i };
+      headers.forEach((h, j) => { obj[h] = vals[j] || ""; });
+      return obj;
+    });
+  };
+  const handleFile = file => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = e => {
+      const parsed = parseCsv(e.target.result);
+      const updated = [...candidates, ...parsed];
+      setCandidates(updated); save("candidates", updated);
+      setMessages({}); setStatuses({});
+    };
+    reader.readAsText(file, "UTF-8");
+  };
+
+  const deleteCandidate = id => { const u = candidates.filter(c => c.id !== id); setCandidates(u); save("candidates", u); setMessages({}); setStatuses({}); };
+  const saveCandEdit = () => {
+    const u = candidates.map((c, i) => i === editingCand ? { ...c, ...candForm } : c);
+    setCandidates(u); save("candidates", u); setEditingCand(null);
+  };
+
+  // ── Generate ────────────────────────────────────────────────
+  const currentJob = jobs.find(j => j.id === selJob);
+  const generateOne = async idx => {
+    if (!currentJob || !apiKey) return;
+    setStatuses(s => ({ ...s, [idx]: "loading" }));
+    try {
+      const text = await callAPI(apiKey, [{ role: "user", content: buildScoutPrompt(company, currentJob, candidates[idx], currentJob.template) }], 2048);
+      setMessages(m => ({ ...m, [idx]: text })); setStatuses(s => ({ ...s, [idx]: "done" }));
+    } catch { setStatuses(s => ({ ...s, [idx]: "error" })); }
+  };
+  const generateAll = async () => { for (let i = 0; i < candidates.length; i++) await generateOne(i); };
+
+  const copyMsg = idx => { navigator.clipboard.writeText(messages[idx] || ""); setCopied(idx); setTimeout(() => setCopied(null), 1500); };
+  const exportCsv = () => {
+    const rows = [["氏名", "件名", "本文"]];
+    candidates.forEach((c, i) => {
+      const msg = messages[i] || "";
+      const subject = (msg.match(/件名[：:]\s*(.+)/) || [])[1] || "";
+      const body = (msg.match(/本文[：:\n]([\s\S]+)/) || [])[1]?.trim() || "";
+      rows.push([c.name || "", subject, body]);
+    });
+    const csv = rows.map(r => r.map(v => `"${v.replace(/"/g, '""')}"`).join(",")).join("\n");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob(["\uFEFF" + csv], { type: "text/csv" }));
+    a.download = "scout_messages.csv"; a.click();
+  };
+
+  const doneCount = Object.values(statuses).filter(s => s === "done").length;
+  const checks = [[!!apiKey, "APIキーを設定", () => setTab(0)], [!!company.name, "会社情報を設定", () => setTab(0)], [jobs.length > 0, "求人を登録", () => setTab(0)], [candidates.length > 0, "候補者を追加", () => setTab(1)]];
+  const navItems = [{ label: "設定", icon: "⚙️" }, { label: "候補者", icon: "👤", badge: candidates.length }, { label: "文面生成", icon: "✉️", badge: doneCount }];
+
+  return (
+    <div className="min-h-screen bg-slate-50">
+      {/* Header */}
+      <header className="bg-white border-b border-gray-100 px-6 py-4 flex items-center justify-between sticky top-0 z-20 shadow-sm">
+        <div className="flex items-center gap-3">
+          <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white text-sm font-bold">S</div>
+          <div>
+            <h1 className="text-sm font-bold text-gray-800 leading-none">Scout AI</h1>
+            <p className="text-xs text-gray-400 mt-0.5">スカウト自動化ツール</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-1 bg-gray-100 rounded-xl p-1">
+          {navItems.map((n, i) => (
+            <button key={i} onClick={() => setTab(i)}
+              className={`relative flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium transition-all ${tab === i ? "bg-white text-blue-600 shadow-sm" : "text-gray-500 hover:text-gray-700"}`}>
+              <span>{n.icon}</span>{n.label}
+              {n.badge > 0 && <span className="absolute -top-1 -right-1 bg-blue-500 text-white text-xs rounded-full w-4 h-4 flex items-center justify-center">{n.badge}</span>}
+            </button>
+          ))}
+        </div>
+        <div className="w-24" />
+      </header>
+
+      <main className="max-w-6xl mx-auto px-6 py-8">
+
+        {/* ── 設定 ── */}
+        {tab === 0 && (
+          <div className="space-y-6">
+            {/* API Key */}
+            <Card title="APIキー設定" icon="🔑"
+              action={<button onClick={() => { save("apiKey", apiKey); setApiKeySaved(true); setTimeout(() => setApiKeySaved(false), 2000); }}
+                className={`text-xs px-3 py-1.5 rounded-lg font-medium transition-all ${apiKeySaved ? "bg-green-50 text-green-600" : "bg-blue-600 text-white hover:bg-blue-700"}`}>
+                {apiKeySaved ? "✓ 保存済" : "保存"}
+              </button>}>
+              <p className="text-xs text-gray-400 mb-3">Anthropic Console（<a href="https://console.anthropic.com" target="_blank" className="text-blue-500 underline">console.anthropic.com</a>）で取得したAPIキーを入力してください。</p>
+              <div className="flex gap-2">
+                <input type={showApiKey ? "text" : "password"} value={apiKey} onChange={e => setApiKey(e.target.value)}
+                  placeholder="sk-ant-xxxxxxxxxxxxxxxx"
+                  className="flex-1 border border-gray-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200 font-mono" />
+                <button onClick={() => setShowApiKey(!showApiKey)} className="px-3 py-2 border border-gray-200 rounded-xl text-sm text-gray-500 hover:bg-gray-50">{showApiKey ? "隠す" : "表示"}</button>
+              </div>
+              {apiKey && <p className="text-xs text-green-600 mt-2">✓ APIキーが設定されています</p>}
+            </Card>
+
+            <div className="grid grid-cols-2 gap-6">
+              {/* Company */}
+              <Card title="会社情報" icon="🏢"
+                action={<button onClick={saveCompany} className={`text-xs px-3 py-1.5 rounded-lg font-medium transition-all ${companySaved ? "bg-green-50 text-green-600" : "bg-blue-600 text-white hover:bg-blue-700"}`}>{companySaved ? "✓ 保存済" : "保存"}</button>}>
+                <Input label="会社名" value={company.name} onChange={v => setCompany(p => ({ ...p, name: v }))} placeholder="株式会社〇〇" />
+                <Textarea label="事業内容" value={company.business} onChange={v => setCompany(p => ({ ...p, business: v }))} rows={3} placeholder="SaaS型のHRテクノロジーを提供..." />
+                <Textarea label="社風・カルチャー" value={company.culture} onChange={v => setCompany(p => ({ ...p, culture: v }))} rows={2} placeholder="自律・挑戦を重んじるフラットな組織..." />
+                <Textarea label="会社の魅力・強み" value={company.appeal} onChange={v => setCompany(p => ({ ...p, appeal: v }))} rows={2} placeholder="成長中のスタートアップ、ストックオプションあり..." />
+              </Card>
+
+              {/* Jobs */}
+              {!editingJob ? (
+                <Card title={`求人管理 (${jobs.length}件)`} icon="📋"
+                  action={<button onClick={openNewJob} className="text-xs px-3 py-1.5 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700">＋ 新規追加</button>}>
+                  {jobs.length === 0
+                    ? <div className="text-center py-10 text-gray-300"><div className="text-4xl mb-2">📋</div><p className="text-sm">求人がまだありません</p></div>
+                    : <div className="space-y-2">
+                        {jobs.map(j => (
+                          <div key={j.id} className="flex items-center gap-3 p-3 rounded-xl border border-gray-100 hover:border-blue-100 hover:bg-blue-50 transition group">
+                            <div className="flex-1 min-w-0">
+                              <p className="text-sm font-medium text-gray-800 truncate">{j.title || "（未設定）"}</p>
+                              <p className="text-xs text-gray-400 truncate">{j.description || "—"}</p>
+                              {j.template && <span className="text-xs text-green-600">✓ テンプレートあり</span>}
+                            </div>
+                            <div className="flex gap-1">
+                              <button onClick={() => openEditJob(j)} className="text-xs px-2.5 py-1 rounded-lg border border-gray-200 text-gray-500 hover:bg-white">編集</button>
+                              <button onClick={() => deleteJob(j.id)} className="text-xs px-2.5 py-1 rounded-lg border border-red-100 text-red-400 hover:bg-white">削除</button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                  }
+                </Card>
+              ) : (
+                <Card title={editingJob === "new" ? "求人を新規追加" : "求人を編集"} icon="📋"
+                  action={<button onClick={() => setEditingJob(null)} className="text-xs text-gray-400 hover:text-gray-600">← 戻る</button>}>
+                  <Input label="ポジション名 *" value={jobForm.title} onChange={v => setJobForm(p => ({ ...p, title: v }))} placeholder="バックエンドエンジニア" />
+                  <Textarea label="業務内容" value={jobForm.description} onChange={v => setJobForm(p => ({ ...p, description: v }))} rows={2} placeholder="toB SaaSのAPI設計・開発..." />
+                  <Textarea label="必要スキル・経験" value={jobForm.requirements} onChange={v => setJobForm(p => ({ ...p, requirements: v }))} rows={2} placeholder="Go/Python 3年以上、AWS経験..." />
+                  <Textarea label="条件・待遇" value={jobForm.conditions} onChange={v => setJobForm(p => ({ ...p, conditions: v }))} rows={2} placeholder="年収600〜900万、リモートOK..." />
+                  <Textarea label="スカウト文面テンプレート" value={jobForm.template} onChange={v => setJobForm(p => ({ ...p, template: v }))} rows={6} hint="（任意）{{変更箇所}}で囲む"
+                    placeholder={"件名: {{件名}}\n\n本文:\n{{氏名}}様\n\nはじめまして。採用担当の〇〇です。\n{{スキル・経験への言及}}\n\n※この一文は固定で変えません。\n\nぜひ一度お話しできればと思います。"} />
+                  <div className="flex gap-2">
+                    <button onClick={() => setEditingJob(null)} className="flex-1 py-2.5 border border-gray-200 rounded-xl text-sm text-gray-500">キャンセル</button>
+                    <button onClick={saveJob} disabled={!jobForm.title} className="flex-1 py-2.5 bg-blue-600 text-white rounded-xl text-sm font-medium disabled:opacity-30">保存する</button>
+                  </div>
+                </Card>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ── 候補者 ── */}
+        {tab === 1 && (
+          <div className="grid grid-cols-2 gap-6">
+            <Card title="候補者を追加" icon="➕">
+              <p className="text-xs text-gray-400 mb-3">媒体のプロフィールをコピーして貼り付けると、AIが自動で情報を抽出します。</p>
+              <Textarea label="プロフィールテキストを貼り付け" value={pasteText} onChange={setPasteText} rows={10}
+                placeholder={"田中太郎\n株式会社ABC / シニアエンジニア\n\nReact・TypeScriptを用いたWebアプリ開発に5年従事。\n\n【スキル】React, TypeScript, Go, AWS"} />
+              {extractErr && <p className="text-xs text-red-500 mb-2">{extractErr}</p>}
+              {!apiKey && <p className="text-xs text-amber-500 mb-2">⚠ 設定タブでAPIキーを入力してください</p>}
+              <button onClick={extractCandidate} disabled={!pasteText.trim() || extracting || !apiKey}
+                className="w-full py-3 bg-blue-600 text-white rounded-xl text-sm font-medium hover:bg-blue-700 disabled:opacity-30 flex items-center justify-center gap-2">
+                {extracting ? "🤖 抽出中…" : "✨ 情報を抽出して追加"}
+              </button>
+              <div className="flex items-center gap-3 my-4">
+                <div className="flex-1 h-px bg-gray-100" /><span className="text-xs text-gray-300">または</span><div className="flex-1 h-px bg-gray-100" />
+              </div>
+              <button onClick={() => fileRef.current.click()} className="w-full py-2.5 border-2 border-dashed border-gray-200 rounded-xl text-sm text-gray-400 hover:border-blue-200 hover:text-blue-400 flex items-center justify-center gap-2">
+                📂 CSVファイルをアップロード
+              </button>
+              <input ref={fileRef} type="file" accept=".csv" className="hidden" onChange={e => handleFile(e.target.files[0])} />
+            </Card>
+
+            <Card title={`候補者リスト (${candidates.length}件)`} icon="👤"
+              action={candidates.length > 0 && <button onClick={() => { setCandidates([]); save("candidates", []); setMessages({}); setStatuses({}); }} className="text-xs text-red-400 hover:text-red-600">全件削除</button>}>
+              {candidates.length === 0
+                ? <div className="text-center py-16 text-gray-300"><div className="text-4xl mb-2">👤</div><p className="text-sm">候補者がまだいません</p></div>
+                : <div className="space-y-2 max-h-96 overflow-auto pr-1">
+                    {candidates.map((c, i) => (
+                      <div key={c.id || i} className="flex items-start gap-3 p-3 rounded-xl border border-gray-100 hover:border-blue-100 group transition">
+                        <div className="w-9 h-9 bg-blue-600 text-white rounded-xl flex items-center justify-center text-sm font-bold shrink-0">{(c.name || "?")[0]}</div>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-semibold text-gray-800">{c.name || `候補者${i + 1}`}</p>
+                          <p className="text-xs text-gray-400 truncate">{[c.current_company, c.experience].filter(Boolean).join(" · ")}</p>
+                          {c.skills && <p className="text-xs text-gray-400 truncate">{c.skills}</p>}
+                        </div>
+                        <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition shrink-0">
+                          <button onClick={() => { setEditingCand(i); setCandForm({ name: c.name || "", skills: c.skills || "", experience: c.experience || "", current_company: c.current_company || "", background: c.background || "" }); }}
+                            className="text-xs px-2 py-1 border border-gray-200 rounded-lg text-gray-400 hover:bg-white">編集</button>
+                          <button onClick={() => deleteCandidate(c.id || "")} className="text-xs px-2 py-1 border border-red-100 rounded-lg text-red-400 hover:bg-white">削除</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+              }
+            </Card>
+          </div>
+        )}
+
+        {/* ── 文面生成 ── */}
+        {tab === 2 && (
+          <div className="grid grid-cols-5 gap-6">
+            <div className="col-span-2 space-y-4">
+              {/* Checklist */}
+              <div className="bg-white rounded-2xl border border-gray-100 shadow-sm px-5 py-4">
+                <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-3">準備状況</p>
+                {checks.map(([ok, label, go], i) => (
+                  <div key={i} className="flex items-center gap-2 py-1">
+                    <div className={`w-4 h-4 rounded-full flex items-center justify-center text-xs shrink-0 ${ok ? "bg-green-100 text-green-600" : "bg-gray-100 text-gray-300"}`}>{ok ? "✓" : "○"}</div>
+                    {ok ? <span className="text-sm text-gray-600">{label}</span> : <button className="text-sm text-blue-500 hover:underline" onClick={go}>{label}</button>}
+                  </div>
+                ))}
+              </div>
+
+              {/* Job selector */}
+              <div className="bg-white rounded-2xl border border-gray-100 shadow-sm px-5 py-4">
+                <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-3">対象求人</p>
+                <select value={selJob} onChange={e => { setSelJob(e.target.value); setMessages({}); setStatuses({}); setOpenCard(null); }}
+                  className="w-full border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200 bg-white">
+                  <option value="">求人を選んでください</option>
+                  {jobs.map(j => <option key={j.id} value={j.id}>{j.title}</option>)}
+                </select>
+              </div>
+
+              {/* Actions */}
+              {selJob && candidates.length > 0 && (
+                <div className="space-y-2">
+                  <button onClick={generateAll} className="w-full py-3 bg-blue-600 text-white rounded-xl text-sm font-medium hover:bg-blue-700 flex items-center justify-center gap-2">
+                    ✨ 全件生成（{candidates.length}件）
+                  </button>
+                  {doneCount > 0 && (
+                    <>
+                      <div className="flex items-center gap-3 px-1">
+                        <div className="flex-1 h-1.5 bg-gray-100 rounded-full overflow-hidden">
+                          <div className="h-full bg-green-400 rounded-full transition-all" style={{ width: `${(doneCount / candidates.length) * 100}%` }} />
+                        </div>
+                        <span className="text-xs text-gray-400">{doneCount}/{candidates.length}</span>
+                      </div>
+                      <button onClick={exportCsv} className="w-full py-2.5 border border-gray-200 text-gray-600 rounded-xl text-sm font-medium hover:bg-gray-50 flex items-center justify-center gap-2">
+                        📥 CSVエクスポート
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {/* Candidate list */}
+              {candidates.length > 0 && (
+                <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+                  <div className="max-h-72 overflow-auto divide-y divide-gray-50">
+                    {candidates.map((c, i) => (
+                      <div key={c.id || i} onClick={() => setOpenCard(openCard === i ? null : i)}
+                        className={`flex items-center gap-3 px-4 py-3 cursor-pointer transition ${openCard === i ? "bg-blue-50" : "hover:bg-gray-50"}`}>
+                        <div className="w-8 h-8 bg-blue-600 text-white rounded-lg flex items-center justify-center text-xs font-bold shrink-0">{(c.name || "?")[0]}</div>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-800 truncate">{c.name || `候補者${i + 1}`}</p>
+                          <p className="text-xs text-gray-400 truncate">{c.current_company || ""}</p>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <Badge s={statuses[i] || "idle"} />
+                          <button onClick={e => { e.stopPropagation(); generateOne(i); }} disabled={statuses[i] === "loading" || !apiKey}
+                            className="text-xs px-2 py-1 bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 disabled:opacity-40 font-medium">生成</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Message panel */}
+            <div className="col-span-3">
+              {openCard !== null && candidates[openCard] ? (
+                <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden sticky top-24">
+                  <div className="flex items-center gap-3 px-6 py-4 border-b border-gray-50">
+                    <div className="w-10 h-10 bg-blue-600 text-white rounded-xl flex items-center justify-center font-bold">{(candidates[openCard].name || "?")[0]}</div>
+                    <div>
+                      <p className="font-semibold text-gray-800">{candidates[openCard].name || `候補者${openCard + 1}`}</p>
+                      <p className="text-xs text-gray-400">{[candidates[openCard].current_company, candidates[openCard].experience].filter(Boolean).join(" · ")}</p>
+                    </div>
+                    <div className="ml-auto flex gap-2">
+                      {editMsgIdx === openCard
+                        ? <button onClick={() => { setMessages(m => ({ ...m, [openCard]: editMsgVal })); setEditMsgIdx(null); }} className="text-xs px-3 py-1.5 bg-blue-600 text-white rounded-lg font-medium">保存</button>
+                        : <button onClick={() => { setEditMsgIdx(openCard); setEditMsgVal(messages[openCard] || ""); }} className="text-xs px-3 py-1.5 border border-gray-200 text-gray-500 rounded-lg hover:bg-gray-50">編集</button>
+                      }
+                      <button onClick={() => copyMsg(openCard)} className="text-xs px-3 py-1.5 border border-gray-200 text-gray-500 rounded-lg hover:bg-gray-50">
+                        {copied === openCard ? "✓ コピー済" : "コピー"}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="px-6 py-5 min-h-64">
+                    {!messages[openCard] && statuses[openCard] !== "loading" && (
+                      <div className="flex flex-col items-center justify-center h-48 text-gray-300">
+                        <div className="text-3xl mb-2">✉️</div>
+                        <p className="text-sm">「生成」ボタンを押してください</p>
+                      </div>
+                    )}
+                    {statuses[openCard] === "loading" && (
+                      <div className="flex flex-col items-center justify-center h-48 text-blue-400">
+                        <div className="text-3xl mb-3">⟳</div>
+                        <p className="text-sm">生成中…</p>
+                      </div>
+                    )}
+                    {messages[openCard] && editMsgIdx === openCard && (
+                      <textarea rows={16} value={editMsgVal} onChange={e => setEditMsgVal(e.target.value)}
+                        className="w-full border border-blue-200 rounded-xl px-4 py-3 text-sm font-sans resize-none focus:outline-none leading-relaxed" />
+                    )}
+                    {messages[openCard] && editMsgIdx !== openCard && (
+                      <pre className="text-sm text-gray-700 whitespace-pre-wrap font-sans leading-relaxed">{messages[openCard]}</pre>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="h-full flex items-center justify-center text-gray-300 min-h-64">
+                  <div className="text-center"><div className="text-4xl mb-3">👈</div><p className="text-sm">候補者を選択すると文面が表示されます</p></div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </main>
+
+      {/* Candidate Edit Modal */}
+      {editingCand !== null && (
+        <div className="fixed inset-0 bg-black bg-opacity-30 flex items-center justify-center z-50 p-4" onClick={() => setEditingCand(null)}>
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6" onClick={e => e.stopPropagation()}>
+            <h3 className="font-bold text-gray-800 mb-5">候補者情報を編集</h3>
+            <Input label="氏名" value={candForm.name || ""} onChange={v => setCandForm(p => ({ ...p, name: v }))} placeholder="田中太郎" />
+            <Input label="スキル" value={candForm.skills || ""} onChange={v => setCandForm(p => ({ ...p, skills: v }))} placeholder="React, TypeScript, Node.js" />
+            <Input label="経験年数" value={candForm.experience || ""} onChange={v => setCandForm(p => ({ ...p, experience: v }))} placeholder="5年" />
+            <Input label="現職" value={candForm.current_company || ""} onChange={v => setCandForm(p => ({ ...p, current_company: v }))} placeholder="株式会社〇〇" />
+            <Textarea label="備考" value={candForm.background || ""} onChange={v => setCandForm(p => ({ ...p, background: v }))} rows={2} placeholder="リードエンジニア経験あり..." />
+            <div className="flex gap-2 mt-2">
+              <button onClick={() => setEditingCand(null)} className="flex-1 py-2.5 border border-gray-200 rounded-xl text-sm text-gray-500">キャンセル</button>
+              <button onClick={saveCandEdit} className="flex-1 py-2.5 bg-blue-600 text-white rounded-xl text-sm font-medium">保存</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.render(<App />, document.getElementById("root"));
+</script>
+</body>
+</html>
